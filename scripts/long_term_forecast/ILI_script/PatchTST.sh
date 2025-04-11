@@ -1,29 +1,30 @@
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 
 model_name=PatchTST
 
 python -u run.py \
   --task_name long_term_forecast \
+  --pre_training 1 \
   --is_training 1 \
   --root_path ./dataset/illness/ \
-  --data_path national_illness.csv \
   --model_id ili_36_24 \
   --model $model_name \
   --data custom \
-  --features M \
-  --seq_len 36 \
-  --label_len 18 \
-  --pred_len 24 \
+  --features S \
+  --seq_len 24 \
+  --label_len 6 \
+  --pred_len 12 \
   --e_layers 4 \
   --d_layers 1 \
   --factor 3 \
-  --enc_in 7 \
-  --dec_in 7 \
-  --c_out 7 \
+  --enc_in 1 \
+  --dec_in 1 \
+  --c_out 1 \
   --des 'Exp' \
   --n_heads 4 \
-  --d_model 1024\
-  --itr 1
+  --d_model 1024 \
+  --itr 1 \
+
 
 python -u run.py \
   --task_name long_term_forecast \

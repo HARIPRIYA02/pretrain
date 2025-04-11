@@ -12,7 +12,7 @@ from data_provider.uea import subsample, interpolate_missing, Normalizer
 from sktime.datasets import load_from_tsfile_to_dataframe
 import warnings
 from utils.augmentation import run_augmentation_single
-
+from bisect import bisect_right
 warnings.filterwarnings('ignore')
 
 
@@ -302,6 +302,171 @@ class Dataset_Custom(Dataset):
 
     def __len__(self):
         return len(self.data_x) - self.seq_len - self.pred_len + 1
+
+    def inverse_transform(self, data):
+        return self.scaler.inverse_transform(data)
+
+from dateutil.parser import parse as date_parse
+
+class Dataset_Custom_multi(Dataset):
+    def __init__(self, args, root_path, flag='train', size=None,
+                 features='S', data_path=None, data_files=None,
+                 target='OT', scale=True, timeenc=0, freq='h', seasonal_patterns=None):
+
+        self.args = args
+        self.seq_len, self.label_len, self.pred_len = size if size else (96, 48, 48)
+        assert flag in ['train', 'val', 'test']
+        self.set_type = {'train': 0, 'val': 1, 'test': 2}[flag]
+
+        self.features = features
+        self.target = target
+        self.scale = scale
+        self.timeenc = timeenc
+        self.freq = freq
+        self.root_path = root_path
+
+        # Auto-load all .tsf files if data_files is None
+        if data_files is None:
+            self.data_files = [f for f in os.listdir(root_path) if f.endswith('.tsf')]
+        else:
+            self.data_files = data_files
+
+        self.data = []
+        self.cumulative_lengths = []
+        self.__read_data__()
+    
+    
+
+    def __read_data__(self):
+        self.scaler = StandardScaler()
+        cumulative_sum = 0
+
+        for data_file in self.data_files:
+            assert data_file.endswith(".tsf"), "Only .tsf files are supported in this version."
+            print(f"Parsing TSF file: {data_file}")
+            series_list = []
+            with open(os.path.join(self.root_path, data_file), 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.readlines()
+           
+            reading_data = False
+            for line in lines:
+                line = line.strip()
+                if line.startswith("@data"):
+                    reading_data = True
+                    continue
+                if not reading_data or line == "":
+                    continue
+                parts = line.split(":")
+                if len(parts) < 2:
+                     continue  # Skip malformed lines
+                def is_date(string):
+    # Avoid parsing strings like "T0", "T1", etc.
+                     if string.strip().startswith("T") and string[1:].isdigit():
+                      return False
+                     try:
+                       pd.to_datetime(string, errors='raise')
+                       return True
+                     except:
+                       return False
+
+                timestamp_idx = None
+                for i, part in enumerate(parts):
+                   if is_date(part.strip()):
+                      timestamp_idx = i
+                      break
+
+                if timestamp_idx is None:
+                      print(f"⚠️ No valid timestamp found in line, skipping: {line}")
+                      continue
+
+                try:
+                     start_timestamp = pd.to_datetime(parts[timestamp_idx].strip())
+                     values_str = ":".join(parts[timestamp_idx + 1:])
+                     values = list(map(float, values_str.strip().split(",")))
+                except Exception as e:
+                     print(f"⚠️ Error parsing line: {line}\nReason: {e}")
+                     continue
+                
+                
+                date_range = pd.date_range(start=start_timestamp, periods=len(values), freq=self.freq)
+                df = pd.DataFrame({self.target: values, 'date': date_range})
+                series_list.append(df)
+
+            for df_raw in series_list:
+                if getattr(self.args, "is_pretraining", False):
+                    border1, border2 = 0, len(df_raw)
+                else:
+                    num_train = int(len(df_raw) * 0.6)
+                    num_vali = int(len(df_raw) * 0.2)
+                    num_test = len(df_raw) - num_train - num_vali
+
+                    border1s = [0, num_train - self.seq_len, num_train + num_vali - self.seq_len]
+                    border2s = [num_train, num_train + num_vali, len(df_raw)]
+                    border1 = border1s[self.set_type]
+                    border2 = border2s[self.set_type]
+
+                df_data = df_raw[[self.target]] if self.features == 'S' else df_raw.drop(columns=['date'])
+
+                if self.scale:
+                    data = np.log1p(np.maximum(df_data.values, 0))  # clip negatives to 0 to avoid log1p crash
+
+                    # Check for inf/nan
+                    if not np.isfinite(data[border1:border2]).all():
+                        print(f"⚠️ Skipping series due to invalid values in: {data_file}")
+                        continue
+
+                    self.scaler.fit(data[border1:border2])
+                    data = self.scaler.transform(data)
+
+                else:
+                    data = df_data.values
+
+                df_stamp = df_raw[['date']][border1:border2]
+                df_stamp['date'] = pd.to_datetime(df_stamp['date'])
+
+                if self.timeenc == 0:
+                    df_stamp['month'] = df_stamp.date.apply(lambda row: row.month, 1)
+                    df_stamp['day'] = df_stamp.date.apply(lambda row: row.day, 1)
+                    df_stamp['weekday'] = df_stamp.date.apply(lambda row: row.weekday(), 1)
+                    df_stamp['hour'] = df_stamp.date.apply(lambda row: row.hour, 1)
+                    data_stamp = df_stamp.drop(['date'], axis=1).values
+                else:
+                    data_stamp = time_features(pd.DatetimeIndex(df_stamp['date']), freq=self.freq)
+                    data_stamp = data_stamp.transpose(1, 0)
+
+                series_data = {
+                    'data_x': data[border1:border2],
+                    'data_y': data[border1:border2],
+                    'data_stamp': data_stamp
+                }
+
+                self.data.append(series_data)
+                series_length = len(series_data['data_x']) - self.seq_len - self.pred_len + 1
+                cumulative_sum += series_length
+                self.cumulative_lengths.append(cumulative_sum)
+
+    def __getitem__(self, index):
+        if index >= self.cumulative_lengths[-1]:
+            raise IndexError("Index out of range")
+        dataset_index = bisect_right(self.cumulative_lengths, index)
+        if dataset_index > 0:
+            index -= self.cumulative_lengths[dataset_index - 1]
+
+        series = self.data[dataset_index]
+        s_begin = index
+        s_end = s_begin + self.seq_len
+        r_begin = s_end - self.label_len
+        r_end = r_begin + self.label_len + self.pred_len
+
+        seq_x = series['data_x'][s_begin:s_end]
+        seq_y = series['data_y'][r_begin:r_end]
+        seq_x_mark = series['data_stamp'][s_begin:s_end]
+        seq_y_mark = series['data_stamp'][r_begin:r_end]
+
+        return seq_x, seq_y, seq_x_mark, seq_y_mark
+
+    def __len__(self):
+        return self.cumulative_lengths[-1]
 
     def inverse_transform(self, data):
         return self.scaler.inverse_transform(data)
